@@ -1,138 +1,109 @@
 const fs = require('fs');
-const path = require('path');
-const bigInt = require('big-integer');
 
-if (process.argv.length < 3) {
-  console.error('Usage: node polynomial_secret_c.js <input.json>');
+// Get JSON filename from command-line argument
+const filename = process.argv[2];
+if (!filename) {
+  console.error("Usage: node polynomial_ques.js <json_filename>");
   process.exit(1);
 }
 
-const inputPath = path.resolve(process.argv[2]);
-let raw;
+// Read and parse JSON file synchronously
+let jsonObj;
 try {
-  raw = fs.readFileSync(inputPath, 'utf8');
+  const rawData = fs.readFileSync(filename, 'utf8');
+  jsonObj = JSON.parse(rawData);
 } catch (err) {
-  console.error(`Error reading file ${inputPath}:`, err.message);
+  console.error("Error reading or parsing file:", err.message);
   process.exit(1);
 }
 
-let data;
-try {
-  data = JSON.parse(raw);
-} catch (err) {
-  console.error('Invalid JSON:', err.message);
+// Decode a BigInt from a string with the given base
+function decodeBigInt(str, base) {
+  base = Number(base);
+  if (base <= 36) {
+    return BigInt(parseInt(str, base));
+  } else {
+    throw new Error("Base > 36 not implemented");
+  }
+}
+
+// If modulus is provided, use it; otherwise, do normal integer arithmetic (not recommended)
+const mod = jsonObj.keys.p ? BigInt(jsonObj.keys.p) : null;
+
+function modinv(a, m) {
+  let m0 = m, y = 0n, x = 1n;
+  if (m === 1n) return 0n;
+  a = ((a % m) + m) % m;
+  while (a > 1n) {
+    let q = a / m;
+    [m, a] = [a % m, m];
+    [y, x] = [x - q * y, y];
+  }
+  if (x < 0n) x += m0;
+  return x;
+}
+
+// Extract parameters n and k
+const n = jsonObj.keys.n;
+const k = jsonObj.keys.k;
+
+// Collect points: x as BigInt key, y as decoded BigInt value
+const points = [];
+for (const key in jsonObj) {
+  if (key === "keys") continue;
+  const point = jsonObj[key];
+  if (!point.value || !point.base) {
+    console.error(`Malformed point at x=${key}`);
+    process.exit(1);
+  }
+  points.push([BigInt(key), decodeBigInt(point.value, point.base)]);
+}
+
+if (points.length < k) {
+  console.error(`Not enough shares provided (have ${points.length}, need ${k})`);
   process.exit(1);
 }
 
-// Simple Fraction class using bigInt
-class Fraction {
-  constructor(num, den = bigInt.one) {
-    this.num = bigInt(num);
-    this.den = bigInt(den);
-    this._normalize();
-  }
-  _normalize() {
-    if (this.den.isNegative()) {
-      this.num = this.num.negate();
-      this.den = this.den.negate();
+// Lagrange interpolation to find secret = f(0)
+function lagrangeAt0(points, k, mod) {
+  points = points.slice(0,k);
+  let secret = 0n;
+
+  for (let i = 0; i < k; i++) {
+    const [xi, yi] = points[i];
+    let numerator = 1n;
+    let denominator = 1n;
+
+    for (let j = 0; j < k; j++) {
+      if (j === i) continue;
+      const [xj] = points[j];
+      numerator *= -xj;
+      denominator *= (xi - xj);
+
+      if (mod) {
+        numerator = ((numerator % mod) + mod) % mod;
+        denominator = ((denominator % mod) + mod) % mod;
+      }
     }
-    const g = bigInt.gcd(this.num.abs(), this.den);
-    if (!g.isUnit()) {
-      this.num = this.num.divide(g);
-      this.den = this.den.divide(g);
+
+    let term;
+    if (mod) {
+      term = (yi * numerator % mod) * modinv(denominator, mod) % mod;
+    } else {
+      if (denominator === 0n) {
+        throw new Error("Zero denominator encountered in interpolation");
+      }
+      if ((numerator % denominator) !== 0n) {
+        console.warn("Warning: Fractional division - result may be truncated");
+      }
+      term = yi * numerator / denominator;
     }
+    secret += term;
+    if (mod) secret = ((secret % mod) + mod) % mod;
   }
-  add(other) {
-    const o = Fraction._coerce(other);
-    return new Fraction(
-      this.num.multiply(o.den).add(o.num.multiply(this.den)),
-      this.den.multiply(o.den)
-    );
-  }
-  subtract(other) {
-    const o = Fraction._coerce(other);
-    return new Fraction(
-      this.num.multiply(o.den).subtract(o.num.multiply(this.den)),
-      this.den.multiply(o.den)
-    );
-  }
-  multiply(other) {
-    const o = Fraction._coerce(other);
-    return new Fraction(
-      this.num.multiply(o.num),
-      this.den.multiply(o.den)
-    );
-  }
-  divide(other) {
-    const o = Fraction._coerce(other);
-    return new Fraction(
-      this.num.multiply(o.den),
-      this.den.multiply(o.num)
-    );
-  }
-  valueOf() {
-    return this.num.divide(this.den);
-  }
-  toString() {
-    if (this.den.equals(1)) return this.num.toString();
-    return `${this.num.toString()}/${this.den.toString()}`;
-  }
-  static _coerce(x) {
-    return x instanceof Fraction ? x : new Fraction(x);
-  }
+
+  return secret;
 }
 
-// Decode a string in arbitrary base to bigInt
-function decodeBig(value, base) {
-  const b = bigInt(base);
-  let result = bigInt.zero;
-  const digits = value.split('');
-  for (const ch of digits) {
-    const digit = parseInt(ch, 36); // supports 0-9, a-z
-    if (digit >= base) {
-      throw new Error(`Invalid digit '${ch}' for base ${base}`);
-    }
-    result = result.multiply(b).add(bigInt(digit));
-  }
-  return result;
-}
-
-const { n, k } = data.keys;
-const xs = [];
-const ys = [];
-// collect first k numeric keys
-const keys = Object.keys(data)
-  .filter(k1 => k1 !== 'keys')
-  .map(x => Number(x))
-  .filter(x => !isNaN(x))
-  .sort((a, b) => a - b)
-  .slice(0, k);
-
-if (keys.length < k) {
-  console.error(`Expected at least ${k} roots but found ${keys.length}.`);
-  process.exit(1);
-}
-
-for (const xRaw of keys) {
-  const entry = data[xRaw];
-  const x = bigInt(xRaw);
-  const y = decodeBig(entry.value, parseInt(entry.base, 10));
-  xs.push(x);
-  ys.push(y);
-}
-
-// Compute constant term c = P(0) via Lagrange interpolation: P(0) = sum(y_i * L_i(0))
-let c = new Fraction(0);
-for (let i = 0; i < k; i++) {
-  let Li0 = new Fraction(1);
-  for (let j = 0; j < k; j++) {
-    if (j === i) continue;
-    // factor = (0 - x_j) / (x_i - x_j)
-    const num = xs[j].negate();
-    const den = xs[i].subtract(xs[j]);
-    Li0 = Li0.multiply(new Fraction(num, den));
-  }
-  c = c.add(Li0.multiply(ys[i]));
-}
-
-console.log(`Constant term c = ${c.toString()}`);
+const secret = lagrangeAt0(points, k, mod);
+console.log("Secret (c):", secret.toString());
