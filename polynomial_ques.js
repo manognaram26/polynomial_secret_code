@@ -1,6 +1,3 @@
-// polynomial_secret_c.js
-// Uses 'big-integer' for arbitrary-size integer & fraction arithmetic
-
 const fs = require('fs');
 const path = require('path');
 const bigInt = require('big-integer');
